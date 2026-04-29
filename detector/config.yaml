@@ -1,0 +1,39 @@
+nginx:
+  log_path: /var/log/nginx/hng-access.log
+
+detection:
+  window_seconds: 60                # sliding window size in seconds
+  baseline_window_minutes: 30       # rolling baseline window size
+  baseline_recalc_interval: 60      # recalculate baseline every N seconds
+  z_score_threshold: 3.0            # flag if z-score exceeds this
+  rate_multiplier_threshold: 5.0    # flag if rate > N * baseline_mean
+  error_rate_multiplier: 3.0        # tighten thresholds if 4xx/5xx rate is N * baseline_error_rate
+  min_samples_for_baseline: 30      # minimum per-second samples before baseline is trusted
+  min_hourly_samples: 60            # minimum samples in current hour before preferring it
+  baseline_floor_rps: 1.0           # minimum baseline mean (prevents zero division / over-sensitivity)
+  error_floor_rate: 0.05            # minimum baseline error rate
+
+blocking:
+  enabled: true
+  unban_schedule:                   # backoff durations in seconds
+    - 600                           # 10 minutes (1st offense)
+    - 1800                          # 30 minutes (2nd offense)
+    - 7200                          # 2 hours (3rd offense)
+    # 4th+ offense = permanent
+
+slack:
+  webhook_url: ""                   # set via SLACK_WEBHOOK_URL env var or here
+  enabled: true
+  timeout_seconds: 5
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8080
+  refresh_interval_ms: 3000         # UI refresh interval in milliseconds
+
+audit:
+  log_path: /var/log/anomaly-detector/audit.log
+  enabled: true
+
+logging:
+  level: INFO
