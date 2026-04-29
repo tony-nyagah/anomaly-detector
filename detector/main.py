@@ -10,17 +10,18 @@ import logging
 import os
 import signal
 import time
-import yaml
 from pathlib import Path
+
+import yaml
 from dotenv import load_dotenv
 
-from .monitor import tail_log, LogEntry
 from .baseline import BaselineTracker
-from .detector import AnomalyDetector
 from .blocker import Blocker
-from .unbanner import UnbanScheduler
-from .notifier import SlackNotifier, AuditLogger
 from .dashboard import Dashboard
+from .detector import AnomalyDetector
+from .monitor import LogEntry, tail_log
+from .notifier import AuditLogger, SlackNotifier
+from .unbanner import UnbanScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
+
 
 def _load_config() -> dict:
     """Load and return the merged configuration dictionary.
@@ -72,13 +74,42 @@ def _get_ban_duration(offense_count: int, blocking_config: dict) -> int | None:
     schedule: list = blocking_config.get("unban_schedule", [600, 1800, 7200])
     idx: int = offense_count - 1
     if idx >= len(schedule):
-        return None          # permanent
+        return None  # permanent
     return int(schedule[idx])
+
+
+# ---------------------------------------------------------------------------
+# Second ticker — records zero-count seconds so idle time pulls baseline down
+# ---------------------------------------------------------------------------
+
+
+async def _second_ticker(
+    baseline: BaselineTracker,
+    second_counts: dict,
+) -> None:
+    """Fire every wall-clock second and flush that second's count into the
+    baseline — even if it is zero.  Without this, idle seconds are never
+    recorded and the baseline mean only reflects seconds that had traffic,
+    causing it to be artificially inflated.
+
+    ``second_counts`` is a shared dict with keys ``count`` and ``errors``
+    that ``_process_loop`` increments as entries arrive.
+    """
+    while True:
+        await asyncio.sleep(1.0)
+        now_s = int(time.time()) - 1  # the second that just completed
+        count = second_counts.pop("count", 0)
+        errors = second_counts.pop("errors", 0)
+        try:
+            await baseline.record_second(count, errors, float(now_s))
+        except Exception as exc:
+            logger.debug("_second_ticker record_second error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
 # Core processing loop
 # ---------------------------------------------------------------------------
+
 
 async def _process_loop(
     queue: asyncio.Queue,
@@ -104,14 +135,15 @@ async def _process_loop(
     # Monotonic timer for 60-second baseline recalculation check
     last_recalc_check: float = time.monotonic()
 
-    # Per-second counter: bucket requests by integer second
-    last_second: int = int(time.time())
-    second_count: int = 0
-    second_error_count: int = 0
+    # Shared counter dict — _second_ticker reads and resets these every second
+    second_counts: dict = {"count": 0, "errors": 0}
 
     # Cooldown: skip repeat bans for the same IP within 5 seconds
     recently_banned: dict[str, float] = {}
     BAN_COOLDOWN = 5.0
+
+    # Start the ticker as a sibling task
+    asyncio.create_task(_second_ticker(baseline, second_counts), name="second_ticker")
 
     while True:
         try:
@@ -119,21 +151,11 @@ async def _process_loop(
             queue.task_done()
 
             # ------------------------------------------------------------------
-            # Per-second counter bookkeeping
-            # Flush the previous second's counts into baseline when we advance
+            # Increment shared per-second counters (ticker flushes them)
             # ------------------------------------------------------------------
-            entry_second: int = int(entry.raw_timestamp)
-            if entry_second != last_second:
-                await baseline.record_second(
-                    second_count, second_error_count, float(last_second)
-                )
-                second_count = 0
-                second_error_count = 0
-                last_second = entry_second
-
-            second_count += 1
+            second_counts["count"] += 1
             if entry.status >= 400:
-                second_error_count += 1
+                second_counts["errors"] += 1
 
             # ------------------------------------------------------------------
             # Anomaly detection
@@ -187,7 +209,10 @@ async def _process_loop(
                         )
                         logger.warning(
                             "Banned %s for %s (offense #%d, %s)",
-                            ip, duration_str, offense_count, condition,
+                            ip,
+                            duration_str,
+                            offense_count,
+                            condition,
                         )
 
             elif kind == "global":
@@ -234,7 +259,9 @@ async def _process_loop(
                     )
                     logger.info(
                         "Baseline recalculated: mean=%.3f stddev=%.3f source=%s",
-                        mean, stddev, source,
+                        mean,
+                        stddev,
+                        source,
                     )
 
         except asyncio.CancelledError:
@@ -246,6 +273,7 @@ async def _process_loop(
 # ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
+
 
 async def _shutdown(
     tasks: list,
@@ -277,6 +305,7 @@ async def _shutdown(
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 async def main() -> None:
     """Orchestrate and run the anomaly-detection daemon.
@@ -331,8 +360,14 @@ async def main() -> None:
         ),
         asyncio.create_task(
             _process_loop(
-                queue, detector_inst, baseline, blocker,
-                unbanner, notifier, audit_logger, config,
+                queue,
+                detector_inst,
+                baseline,
+                blocker,
+                unbanner,
+                notifier,
+                audit_logger,
+                config,
             ),
             name="process_loop",
         ),
